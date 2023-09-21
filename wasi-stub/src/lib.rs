@@ -2,10 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use wast::{
     core::{
-        Expression, Func, FuncKind, FunctionType, HeapType, InlineExport, Instruction, ItemKind,
-        Local, ModuleField, ModuleKind, RefType, TypeUse, ValType,
+        Expression, Func, FuncKind, InlineExport, Instruction, ItemKind, Local, ModuleField,
+        ModuleKind, TypeUse,
     },
-    token::{Id, Index, NameAnnotation},
+    token::Index,
     Wat,
 };
 
@@ -31,16 +31,6 @@ enum ImportIndex {
     Keep(u32),
 }
 
-struct ToStub {
-    fields_index: usize,
-    span: wast::token::Span,
-    nb_results: usize,
-    ty: TypeUse<'static, FunctionType<'static>>,
-    name: Option<NameAnnotation<'static>>,
-    id: Option<Id<'static>>,
-    locals: Vec<Local<'static>>,
-}
-
 impl ShouldStub {
     fn should_stub(&self, module: &str, function: &str) -> bool {
         if let Some(functions) = self.modules.get(module) {
@@ -52,22 +42,6 @@ impl ShouldStub {
             false
         }
     }
-}
-
-fn static_id(id: Option<Id>) -> Option<Id<'static>> {
-    id.map(|id| {
-        let mut name = id.name().to_owned();
-        name.insert(0, '$');
-        let parser = Box::leak(Box::new(
-            wast::parser::ParseBuffer::new(name.leak()).unwrap(),
-        ));
-        wast::parser::parse::<Id>(parser).unwrap()
-    })
-}
-fn static_name_annotation(name: Option<NameAnnotation>) -> Option<NameAnnotation<'static>> {
-    name.map(|name| NameAnnotation {
-        name: String::from(name.name).leak(),
-    })
 }
 
 pub fn stub_wasi_functions(
@@ -88,13 +62,12 @@ pub fn stub_wasi_functions(
     let fields = match &mut module.kind {
         ModuleKind::Text(f) => f,
         ModuleKind::Binary(_) => {
-            println!("[WARNING] binary directives are not supported");
-            return Ok(binary.to_owned());
+            anyhow::bail!("binary directives are not supported");
         }
     };
 
     let mut types = Vec::new();
-    let mut imports = Vec::new();
+    let mut nb_imports: u32 = 0;
     let mut to_stub = Vec::new();
     let mut insert_stubs_index = None;
     let mut new_import_indices = Vec::new();
@@ -118,64 +91,41 @@ pub fn stub_wasi_functions(
                         let wast::core::TypeDef::Func(func_typ) = &typ.def else {
                             continue;
                         };
-                        let id = static_id(i.item.id);
                         let locals: Vec<Local> = func_typ
                             .params
                             .iter()
-                            .map(|(id, name, val_type)| Local {
-                                id: static_id(*id),
-                                name: static_name_annotation(*name),
-                                // FIXME: This long match dance is _only_ to make the lifetime of ty 'static. A lot of things have to go through this dance (see the `static_*` function...)
-                                // Instead, we should write the new function here, in place, by replacing `field`. This is currently done in the for loop at the veryend of this function.
-                                // THEN, at the end of the loop, swap every function in it's right place. No need to do more !
-                                ty: match val_type {
-                                    ValType::I32 => ValType::I32,
-                                    ValType::I64 => ValType::I64,
-                                    ValType::F32 => ValType::F32,
-                                    ValType::F64 => ValType::F64,
-                                    ValType::V128 => ValType::V128,
-                                    ValType::Ref(r) => ValType::Ref(RefType {
-                                        nullable: r.nullable,
-                                        heap: match r.heap {
-                                            HeapType::Func => HeapType::Func,
-                                            HeapType::Extern => HeapType::Extern,
-                                            HeapType::Any => HeapType::Any,
-                                            HeapType::Eq => HeapType::Eq,
-                                            HeapType::Struct => HeapType::Struct,
-                                            HeapType::Array => HeapType::Array,
-                                            HeapType::I31 => HeapType::I31,
-                                            HeapType::NoFunc => HeapType::NoFunc,
-                                            HeapType::NoExtern => HeapType::NoExtern,
-                                            HeapType::None => HeapType::None,
-                                            HeapType::Index(index) => {
-                                                HeapType::Index(match index {
-                                                    Index::Num(n, s) => Index::Num(n, s),
-                                                    Index::Id(id) => {
-                                                        Index::Id(static_id(Some(id)).unwrap())
-                                                    }
-                                                })
-                                            }
-                                        },
-                                    }),
-                                },
-                            })
+                            .map(|&(id, name, ty)| Local { id, name, ty })
                             .collect();
-                        to_stub.push(ToStub {
-                            fields_index: field_idx,
-                            span: i.span,
-                            nb_results: func_typ.results.len(),
+                        let nb_results = func_typ.results.len();
+                        let span = i.span;
+                        let name = i.item.name;
+                        let instructions = {
+                            let mut res = Vec::with_capacity(nb_results);
+                            for _ in 0..nb_results {
+                                res.push(Instruction::I32Const(return_value as i32));
+                            }
+                            res
+                        };
+                        *field = ModuleField::Func(Func {
+                            span,
+                            id: i.item.id,
+                            name,
+                            // no exports
+                            exports: InlineExport { names: Vec::new() },
+                            kind: wast::core::FuncKind::Inline {
+                                locals: locals.into_boxed_slice(),
+                                expression: Expression {
+                                    instrs: instructions.into_boxed_slice(),
+                                },
+                            },
                             ty,
-                            name: i.item.name.map(|n| NameAnnotation {
-                                name: n.name.to_owned().leak(),
-                            }),
-                            id,
-                            locals,
                         });
+                        to_stub.push(field_idx);
                         ImportIndex::ToStub(to_stub.len() as u32 - 1)
                     }
                     _ => {
-                        imports.push(i);
-                        ImportIndex::Keep(imports.len() as u32 - 1)
+                        nb_imports += 1;
+                        ImportIndex::Keep(nb_imports - 1)
                     }
                 };
                 new_import_indices.push(new_index);
@@ -203,7 +153,7 @@ pub fn stub_wasi_functions(
                                     if let Some(new_index) = new_import_indices.get(*index as usize)
                                     {
                                         *index = match new_index {
-                                            ImportIndex::ToStub(idx) => *idx + imports.len() as u32,
+                                            ImportIndex::ToStub(idx) => *idx + nb_imports,
                                             ImportIndex::Keep(idx) => *idx,
                                         };
                                     }
@@ -217,49 +167,15 @@ pub fn stub_wasi_functions(
             _ => {}
         }
     }
-    drop(imports);
-    drop(types);
 
     let insert_stubs_index = insert_stubs_index
         .expect("This is weird: there are no code sections in this wasm executable !");
 
-    for (
-        already_stubbed,
-        ToStub {
-            fields_index,
-            span,
-            nb_results,
-            ty,
-            name,
-            id,
-            locals,
-        },
-    ) in to_stub.into_iter().enumerate()
-    {
-        let instructions = {
-            let mut res = Vec::with_capacity(nb_results);
-            for _ in 0..nb_results {
-                // Weird value, hopefully this makes it easier to track usage of these stubbed functions.
-                res.push(Instruction::I32Const(return_value as i32));
-            }
-            res
-        };
-        let function = Func {
-            span,
-            id,
-            name,
-            // no exports
-            exports: InlineExport { names: Vec::new() },
-            kind: wast::core::FuncKind::Inline {
-                locals: locals.into_boxed_slice(),
-                expression: Expression {
-                    instrs: instructions.into_boxed_slice(),
-                },
-            },
-            ty,
-        };
-        fields.insert(insert_stubs_index, ModuleField::Func(function));
-        fields.remove(fields_index - already_stubbed);
+    for (already_stubbed, fields_index) in to_stub.into_iter().enumerate() {
+        // Put the function at fields_index to insert_stubs_index.
+        let func = fields.remove(fields_index - already_stubbed);
+        debug_assert!(matches!(func, ModuleField::Func(_)));
+        fields.insert(insert_stubs_index - 1, func);
     }
 
     Ok(module.encode()?)
